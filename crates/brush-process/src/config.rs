@@ -42,6 +42,18 @@ pub struct ProcessConfig {
     )]
     #[config(default = "String::from(\"export_{iter}.ply\")")]
     pub export_name: String,
+    /// Save training status to a JSON file for external monitoring
+    #[arg(long, help_heading = "Process options", default_value = "false")]
+    #[config(default = false)]
+    pub save_status: bool,
+    /// Filename for the status JSON file
+    #[arg(
+        long,
+        help_heading = "Process options",
+        default_value = "training_status.json"
+    )]
+    #[config(default = "String::from(\"training_status.json\")")]
+    pub status_filename: String,
 }
 
 #[derive(Config, Args)]

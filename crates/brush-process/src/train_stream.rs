@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use serde_json::json;
 
 use crate::{
     config::ProcessArgs, eval_export::eval_save_to_disk, message::ProcessMessage,
@@ -21,6 +22,61 @@ use rand::SeedableRng;
 use tokio::sync::oneshot::Receiver;
 use tokio_stream::StreamExt;
 use web_time::{Duration, Instant};
+
+/// Save training status to a JSON file for external monitoring
+async fn save_status_file(
+    process_config: &crate::config::ProcessConfig,
+    iter: u32,
+    total_steps: u32,
+    elapsed: Duration,
+    splat_count: u32,
+    status: &str,
+    last_psnr: Option<f32>,
+    last_ssim: Option<f32>,
+    current_export_file: Option<&str>,
+) -> Result<(), std::io::Error> {
+    if !process_config.save_status {
+        return Ok(());
+    }
+
+    let export_path = Path::new(&process_config.export_path);
+    let status_path = export_path.join(&process_config.status_filename);
+
+    let progress_percentage = (iter as f32 / total_steps as f32) * 100.0;
+    let elapsed_seconds = elapsed.as_secs_f64();
+    
+    // Estimate remaining time based on current progress
+    let estimated_remaining_seconds = if iter > 0 {
+        let avg_time_per_step = elapsed_seconds / iter as f64;
+        let remaining_steps = total_steps.saturating_sub(iter) as f64;
+        avg_time_per_step * remaining_steps
+    } else {
+        0.0
+    };
+
+    let status_json = json!({
+        "current_iteration": iter,
+        "total_iterations": total_steps,
+        "progress_percentage": progress_percentage,
+        "elapsed_time_seconds": elapsed_seconds,
+        "estimated_remaining_seconds": estimated_remaining_seconds,
+        "current_splat_count": splat_count,
+        "last_eval_psnr": last_psnr,
+        "last_eval_ssim": last_ssim,
+        "export_path": process_config.export_path,
+        "current_export_file": current_export_file,
+        "status": status,
+        "last_updated": chrono::Utc::now().to_rfc3339()
+    });
+
+    // Create directory if it doesn't exist
+    if let Some(parent) = status_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    tokio::fs::write(&status_path, status_json.to_string()).await?;
+    Ok(())
+}
 
 pub(crate) async fn train_stream(
     vfs: Arc<BrushVfs>,
@@ -108,6 +164,23 @@ pub(crate) async fn train_stream(
     let mut dataloader = SceneLoader::new(&dataset.train, 42, &device);
     let mut trainer = SplatTrainer::new(&process_args.train_config, &device);
 
+    // Variables to track status for external monitoring
+    let mut last_psnr: Option<f32> = None;
+    let mut last_ssim: Option<f32> = None;
+
+    // Save initial status
+    let _ = save_status_file(
+        process_config,
+        process_config.start_iter,
+        process_args.train_config.total_steps,
+        train_duration,
+        splats.num_splats(),
+        "starting",
+        None,
+        None,
+        None,
+    ).await;
+
     log::info!("Start training loop.");
     for iter in process_args.process_config.start_iter..process_args.train_config.total_steps {
         let step_time = Instant::now();
@@ -161,6 +234,10 @@ pub(crate) async fn train_stream(
                 psnr /= count as f32;
                 ssim /= count as f32;
 
+                // Update tracked values
+                last_psnr = Some(psnr);
+                last_ssim = Some(ssim);
+
                 visualize.log_eval_stats(iter, psnr, ssim)?;
 
                 let message = ProcessMessage::EvalResult {
@@ -170,6 +247,19 @@ pub(crate) async fn train_stream(
                 };
 
                 emitter.emit(message).await;
+
+                // Save status after evaluation
+                let _ = save_status_file(
+                    process_config,
+                    iter,
+                    process_args.train_config.total_steps,
+                    train_duration,
+                    splats.num_splats(),
+                    "evaluating",
+                    last_psnr,
+                    last_ssim,
+                    None,
+                ).await;
             }
         }
 
@@ -194,6 +284,19 @@ pub(crate) async fn train_stream(
             tokio::fs::write(export_path.join(&export_name), splat_data)
                 .await
                 .with_context(|| format!("Failed to export ply {export_path:?}"))?;
+
+            // Save status after export
+            let _ = save_status_file(
+                process_config,
+                iter,
+                process_args.train_config.total_steps,
+                train_duration,
+                splats.num_splats(),
+                "exporting",
+                last_psnr,
+                last_ssim,
+                Some(&export_name),
+            ).await;
         }
 
         if let Some(every) = process_args.rerun_config.rerun_log_splats_every {
@@ -234,6 +337,20 @@ pub(crate) async fn train_stream(
                 total_elapsed: train_duration,
             };
             emitter.emit(message).await;
+
+            // Save status during training
+            let status = if is_last_step { "completed" } else { "training" };
+            let _ = save_status_file(
+                process_config,
+                iter,
+                process_args.train_config.total_steps,
+                train_duration,
+                splats.num_splats(),
+                status,
+                last_psnr,
+                last_ssim,
+                None,
+            ).await;
         }
     }
 
